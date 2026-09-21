@@ -27,6 +27,7 @@ const (
 	configureClusterAgentPortScript = "10-configure-cluster-agent-port.sh"
 	configureDqlitePortScript       = "10-configure-dqlite-port.sh"
 	configureDqliteAddressScript    = "10-configure-dqlite-address.sh"
+	configureContainerdProxyScript  = "10-configure-containerd-proxy.sh"
 	configureDNSScript              = "20-microk8s-configure-dns.sh"
 	microk8sJoinScript              = "20-microk8s-join.sh"
 	microk8sEnableScript            = "20-microk8s-enable.sh"
@@ -36,7 +37,7 @@ const (
 	remappedClusterAgentPort = "30000"
 	remappedDqlitePort       = "2379"
 
-	tokenTTL               = 315569260
+	defaultTokenTTL        = 315569260
 	ifmicroK8sInstalled    = "[ -d \"/var/snap/microk8s\" ]"
 	ifmicrok8sNotInstalled = "[ ! -d \"/var/snap/microk8s\" ]"
 )
@@ -96,7 +97,7 @@ func clusterProvider(cluster clusterplugin.Cluster) yip.YipConfig {
 func generateInitStages(cluster clusterplugin.Cluster, token string, userConfig MicroK8sSpec) []yip.Stage {
 	var installCommands []string
 	var upgradeCommands []string
-	installCommands = getBaseInstallCommands(cluster, token, installCommands)
+	installCommands = getBaseInstallCommands(cluster, token, userConfig, installCommands)
 	calicoConfigCommand := addCalicoConfigCommands(userConfig)
 	installCommands = appendCalicoConfigCommand(installCommands, calicoConfigCommand, true)
 
@@ -115,7 +116,7 @@ func generateInitStages(cluster clusterplugin.Cluster, token string, userConfig 
 	}
 
 	// add the bootstrap token
-	installCommands = append(installCommands, fmt.Sprintf("microk8s add-node --token-ttl %v --token %q", tokenTTL, token))
+	installCommands = append(installCommands, fmt.Sprintf("microk8s add-node --token-ttl %v --token %q", joinTokenTTL(userConfig), token))
 	installCommands = append(installCommands, fmt.Sprintf("%s %v %q", scriptPath(configureDNSScript), userConfig.ClusterConfiguration.UseHostDNS, userConfig.ClusterConfiguration.DNS))
 	installCommands = append(installCommands, fmt.Sprintf("%s %q %q", scriptPath(configureAltNamesScript), endpointType, cluster.ControlPlaneHost))
 
@@ -148,7 +149,7 @@ func generateControlPlaneJoinStages(cluster clusterplugin.Cluster, token string,
 	var upgradeCommands []string
 	var clusterAgentPort string = defaultClusterAgentPort
 
-	installCommands = getBaseInstallCommands(cluster, token, installCommands)
+	installCommands = getBaseInstallCommands(cluster, token, userConfig, installCommands)
 	calicoConfigCommand := addCalicoConfigCommands(userConfig)
 	installCommands = appendCalicoConfigCommand(installCommands, calicoConfigCommand, false)
 
@@ -171,7 +172,7 @@ func generateControlPlaneJoinStages(cluster clusterplugin.Cluster, token string,
 	installCommands = append(installCommands, fmt.Sprintf("%s %q %q", scriptPath(configureAltNamesScript), endpointType, cluster.ControlPlaneHost))
 
 	// add the bootstrap token
-	installCommands = append(installCommands, fmt.Sprintf("microk8s add-node --token-ttl %v --token %q", tokenTTL, token))
+	installCommands = append(installCommands, fmt.Sprintf("microk8s add-node --token-ttl %v --token %q", joinTokenTTL(userConfig), token))
 	// label after join
 	installCommands = append(installCommands, scriptPath(configureCPKubeletScript))
 	installCommands = append(installCommands, fmt.Sprintf("%s %s", scriptPath(microk8sKubeConfigScript), userConfig.ClusterConfiguration.WriteKubeconfig))
@@ -200,7 +201,7 @@ func generateWorkerJoinStages(cluster clusterplugin.Cluster, token string, userC
 	var upgradeCommands []string
 	var clusterAgentPort string = defaultClusterAgentPort
 
-	installCommands = getBaseInstallCommands(cluster, token, installCommands)
+	installCommands = getBaseInstallCommands(cluster, token, userConfig, installCommands)
 	calicoConfigCommand := addCalicoConfigCommands(userConfig)
 	installCommands = appendCalicoConfigCommand(installCommands, calicoConfigCommand, false)
 
@@ -236,7 +237,7 @@ func createMicroK8SToken(token string) string {
 	}
 	return hex.EncodeToString(md5.Sum(nil))
 }
-func getBaseInstallCommands(cluster clusterplugin.Cluster, token string, installCommands []string) []string {
+func getBaseInstallCommands(cluster clusterplugin.Cluster, token string, userConfig MicroK8sSpec, installCommands []string) []string {
 
 	// run the script to install microk8s
 	installCommands = append(installCommands, scriptPath(installMicrok8sScript))
@@ -244,7 +245,37 @@ func getBaseInstallCommands(cluster clusterplugin.Cluster, token string, install
 	installCommands = append(installCommands, "mkdir -p /usr/local/.microk8s")
 	installCommands = append(installCommands, "snap list |grep microk8s |cut -f 3 -d ' ' > /usr/local/.microk8s/installed")
 
+	// containerd has to learn about the proxy before anything joins a cluster
+	// or pulls an image, so this sits with the install and runs on every role.
+	if command, ok := containerdProxyCommand(userConfig); ok {
+		installCommands = append(installCommands, command)
+	}
+
 	return installCommands
+}
+
+// containerdProxyCommand builds the call to 10-configure-containerd-proxy.sh,
+// whose usage line is "$0 $http_proxy $https_proxy $no_proxy". It reports false
+// when the user set none of the three, so a node with no proxy does not restart
+// containerd for an empty configuration block.
+func containerdProxyCommand(userConfig MicroK8sSpec) (string, bool) {
+	initConfig := userConfig.InitConfiguration
+	if initConfig.HTTPProxy == "" && initConfig.HTTPSProxy == "" && initConfig.NoProxy == "" {
+		return "", false
+	}
+
+	return fmt.Sprintf("%s %q %q %q", scriptPath(configureContainerdProxyScript),
+		initConfig.HTTPProxy, initConfig.HTTPSProxy, initConfig.NoProxy), true
+}
+
+// joinTokenTTL honours joinTokenTTLInSecs, which types.go documents as
+// defaulting to ten years. The default used to be the only value.
+func joinTokenTTL(userConfig MicroK8sSpec) int64 {
+	if ttl := userConfig.InitConfiguration.JoinTokenTTLInSecs; ttl > 0 {
+		return ttl
+	}
+
+	return defaultTokenTTL
 }
 func addCalicoConfigCommands(userConfig MicroK8sSpec) string {
 	var calicoConfigCommand string
