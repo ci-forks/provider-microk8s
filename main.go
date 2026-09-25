@@ -117,7 +117,7 @@ func generateInitStages(cluster clusterplugin.Cluster, token string, userConfig 
 
 	// add the bootstrap token
 	installCommands = append(installCommands, fmt.Sprintf("microk8s add-node --token-ttl %v --token %q", joinTokenTTL(userConfig), token))
-	installCommands = append(installCommands, fmt.Sprintf("%s %v %q", scriptPath(configureDNSScript), userConfig.ClusterConfiguration.UseHostDNS, userConfig.ClusterConfiguration.DNS))
+	installCommands = append(installCommands, fmt.Sprintf("%s %v %q", scriptPath(configureDNSScript), userConfig.ClusterConfiguration.UseHostDNS, dnsForwarders(userConfig)))
 	installCommands = append(installCommands, fmt.Sprintf("%s %q %q", scriptPath(configureAltNamesScript), endpointType, cluster.ControlPlaneHost))
 
 	addons := parseAddons(userConfig)
@@ -309,12 +309,63 @@ func parseAddons(userConfig MicroK8sSpec) []string {
 	addons := make([]string, 0, len(userConfig.InitConfiguration.Addons))
 	for _, addon := range userConfig.InitConfiguration.Addons {
 		// if dns is enabled by the user, we skip it in the list since we always enable by default
-		if strings.Contains(addon, "dns") {
+		if isDNSAddon(addon) {
 			continue
 		}
 		addons = append(addons, fmt.Sprintf("%q", addon))
 	}
 	return addons
+}
+
+// isDNSAddon reports whether an "addons" entry names the dns addon, with or
+// without arguments. The name is what the entry carries before the colon, so
+// that this and dnsAddonForwarders cannot disagree about which entry the dns
+// addon is: parseAddons drops exactly the entries whose arguments
+// dnsAddonForwarders picks up.
+func isDNSAddon(addon string) bool {
+	name := addon
+	if i := strings.Index(name, ":"); i >= 0 {
+		name = name[:i]
+	}
+
+	return strings.TrimSpace(name) == "dns"
+}
+
+// dnsAddonForwarders returns the arguments of an "addons" entry of the form
+// "dns:<forwarders>", which is microk8s's own spelling for pointing CoreDNS at
+// specific upstream resolvers. parseAddons drops that entry because
+// 20-microk8s-configure-dns.sh already enables the addon, so without this the
+// arguments would go with it.
+func dnsAddonForwarders(userConfig MicroK8sSpec) string {
+	for _, addon := range userConfig.InitConfiguration.Addons {
+		if !isDNSAddon(addon) {
+			continue
+		}
+		if i := strings.Index(addon, ":"); i >= 0 {
+			return strings.TrimSpace(addon[i+1:])
+		}
+	}
+
+	return ""
+}
+
+// dnsForwarders picks the upstream resolvers to hand to
+// 20-microk8s-configure-dns.sh. clusterConfiguration.dns is the documented key
+// and wins; the addon spelling is honoured when that key is unset. An override
+// is logged rather than applied silently, because the two keys disagreeing is a
+// configuration mistake the operator cannot otherwise see.
+func dnsForwarders(userConfig MicroK8sSpec) string {
+	fromAddon := dnsAddonForwarders(userConfig)
+	fromKey := userConfig.ClusterConfiguration.DNS
+
+	if fromKey == "" {
+		return fromAddon
+	}
+	if fromAddon != "" && fromAddon != fromKey {
+		logrus.Printf("clusterConfiguration.dns %q overrides the addons entry dns:%s", fromKey, fromAddon)
+	}
+
+	return fromKey
 }
 func scriptPath(scriptName string) string {
 	return filepath.Join(scriptBasePath, scriptName)

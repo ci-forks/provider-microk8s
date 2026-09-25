@@ -242,3 +242,100 @@ func TestNoProxyConfigRunsNoScript(t *testing.T) {
 		})
 	}
 }
+
+// dnsCommandFor returns the single 20-microk8s-configure-dns.sh call an init
+// node makes, and the 20-microk8s-enable.sh call next to it, so a test can
+// assert both halves of the split: what the dns addon is configured with, and
+// what the remaining addons list still carries.
+func dnsCommandFor(t *testing.T, options string) (dns string, enable string) {
+	t.Helper()
+
+	for _, command := range commandsFor(t, clusterplugin.Cluster{
+		ClusterToken:     "randomstring",
+		ControlPlaneHost: "cluster.example.com",
+		Role:             clusterplugin.RoleInit,
+		Options:          options,
+	}) {
+		if strings.Contains(command, configureDNSScript) {
+			dns = command
+		}
+		if strings.Contains(command, microk8sEnableScript) {
+			enable = command
+		}
+	}
+
+	if dns == "" {
+		t.Fatalf("no %s command for options %q", configureDNSScript, options)
+	}
+
+	return dns, enable
+}
+
+// "dns:<forwarders>" is microk8s's own spelling for the upstream resolvers.
+// parseAddons drops the entry because the dns addon is always enabled
+// separately, so the forwarders have to reach the configure script instead of
+// going with it.
+func TestDNSAddonArgumentsReachTheConfigureScript(t *testing.T) {
+	dns, enable := dnsCommandFor(t, "initConfiguration:\n  addons:\n    - dns:1.1.1.1,9.9.9.9\n    - metallb\n")
+
+	if want := `false "1.1.1.1,9.9.9.9"`; !strings.HasSuffix(dns, want) {
+		t.Errorf("dns command %q does not end in %q", dns, want)
+	}
+	// The entry is still not re-enabled by the addons list, which is what the
+	// skip in parseAddons is for.
+	if strings.Contains(enable, "dns") {
+		t.Errorf("enable command %q re-enables the dns addon", enable)
+	}
+	if !strings.Contains(enable, `"metallb"`) {
+		t.Errorf("enable command %q lost the other addons", enable)
+	}
+}
+
+// The documented key keeps winning, and an addons entry that disagrees with it
+// does not change the command.
+func TestDNSClusterConfigurationKeyWins(t *testing.T) {
+	dns, _ := dnsCommandFor(t, "clusterConfiguration:\n  dns: \"10.0.0.53\"\ninitConfiguration:\n  addons:\n    - dns:1.1.1.1\n")
+
+	if want := `false "10.0.0.53"`; !strings.HasSuffix(dns, want) {
+		t.Errorf("dns command %q does not end in %q", dns, want)
+	}
+}
+
+// A bare "dns" entry carries no configuration, so it stays a no-op: skipped
+// from the addons list and not turned into an empty forwarder argument that
+// would look like a set value to the script.
+func TestBareDNSAddonConfiguresNothing(t *testing.T) {
+	dns, enable := dnsCommandFor(t, "initConfiguration:\n  addons:\n    - dns\n    - metallb\n")
+
+	if want := `false ""`; !strings.HasSuffix(dns, want) {
+		t.Errorf("dns command %q does not end in %q", dns, want)
+	}
+	if strings.Contains(enable, `"dns"`) {
+		t.Errorf("enable command %q re-enables the dns addon", enable)
+	}
+}
+
+// The skip matches the addon name, not the substring, so an addon that merely
+// contains "dns" keeps being enabled and does not silently donate its
+// arguments to CoreDNS.
+func TestAddonNamedLikeDNSIsNotTheDNSAddon(t *testing.T) {
+	dns, enable := dnsCommandFor(t, "initConfiguration:\n  addons:\n    - external-dns:1.1.1.1\n")
+
+	if want := `false ""`; !strings.HasSuffix(dns, want) {
+		t.Errorf("dns command %q does not end in %q", dns, want)
+	}
+	if !strings.Contains(enable, `"external-dns:1.1.1.1"`) {
+		t.Errorf("enable command %q dropped external-dns", enable)
+	}
+}
+
+// useHostDNS and the addon spelling are independent inputs: the script reads
+// the host's resolv.conf when the first argument is true, and the forwarders
+// argument overrides it, so both have to arrive.
+func TestUseHostDNSKeepsTheAddonArguments(t *testing.T) {
+	dns, _ := dnsCommandFor(t, "clusterConfiguration:\n  useHostDNS: true\ninitConfiguration:\n  addons:\n    - dns:1.1.1.1\n")
+
+	if want := `true "1.1.1.1"`; !strings.HasSuffix(dns, want) {
+		t.Errorf("dns command %q does not end in %q", dns, want)
+	}
+}
